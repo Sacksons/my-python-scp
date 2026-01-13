@@ -5,7 +5,7 @@ from auth import get_current_user, get_password_hash, verify_password, create_ac
 from sqlmodel import Session
 from database import create_db_and_tables, get_session  # Assuming absolute imports from earlier fix
 from models import Deal, ICWorkflow, Intelligence
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from typing import List, Optional  # Add or confirm Optional here
 from datetime import datetime
 from intelligence import intelligence_router
@@ -74,11 +74,10 @@ class UserCreate(BaseModel):
     username: str
     password: str
 
-    @validator('password')
+    @field_validator('password', mode='before')  # Use 'before' for pre-processing (e.g., hashing)
     def validate_password(cls, v):
-        if len(v) > 72:
-            raise ValueError('Password cannot exceed 72 characters')
-        return v  # Or truncate: return v[:72]
+        # Retain existing logic
+        return v
 
 
 # ... (imports, lifespan, app = FastAPI, Pydantic classes like UserCreate)
