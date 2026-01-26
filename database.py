@@ -1,48 +1,100 @@
-import psycopg2
-import os
-from sshtunnel import SSHTunnelForwarder
-from sqlmodel import SQLModel, create_engine, Session
+"""
+Database connection and session management.
+Supports direct PostgreSQL connection or SSH tunnel for PythonAnywhere.
+"""
 
-sshtunnel.SSH_TIMEOUT = 10.0
-sshtunnel.TUNNEL_TIMEOUT = 10.0
+from contextlib import contextmanager
+from typing import Generator, Optional
 
-postgres_hostname = "sackson-1234.postgres.pythonanywhere-services.com"  # Replace with your hostname
-postgres_host_port = 1234  # Replace with your port
+import sshtunnel
+from sqlmodel import SQLModel, Session, create_engine
 
-with SSHTunnelForwarder(
-    ('ssh.pythonanywhere.com'),
-    ssh_username='sackson',  # Your PythonAnywhere username
-    ssh_password='your_pythonanywhere_password',  # Website login password (store securely, e.g., via env vars)
-    remote_bind_address=(postgres_hostname, postgres_host_port)
-) as tunnel:
-    # Connect using psycopg2 or any Postgres library
-    connection = psycopg2.connect(
-        user='your_postgres_user',  # Postgres-specific username
-        password='your_postgres_password',
-        host='127.0.0.1', 
-        port=tunnel.local_bind_port,
-        database='your_database_name',
+from config import get_settings
+
+# Module-level engine (initialized lazily)
+_engine = None
+_tunnel: Optional[sshtunnel.SSHTunnelForwarder] = None
+
+
+def _create_ssh_tunnel() -> sshtunnel.SSHTunnelForwarder:
+    """Create SSH tunnel for database connection."""
+    settings = get_settings()
+
+    sshtunnel.SSH_TIMEOUT = settings.SSH_TIMEOUT
+    sshtunnel.TUNNEL_TIMEOUT = settings.TUNNEL_TIMEOUT
+
+    tunnel = sshtunnel.SSHTunnelForwarder(
+        ("ssh.pythonanywhere.com",),
+        ssh_username=settings.PA_USERNAME,
+        ssh_password=settings.PA_PASSWORD,
+        remote_bind_address=(settings.PG_HOST, settings.PG_PORT),
     )
-    # For SQLModel integration (migrate from SQLite)
-    engine = create_engine(f"postgresql://your_postgres_user:your_postgres_password@127.0.0.1:{tunnel.local_bind_port}/your_database_name")
-    SQLModel.metadata.create_all(engine)
-    with Session(engine) as session:
-        # Perform queries, e.g., session.add(YourModel(...)); session.commit()
-    connection.close()
-    # Environment variables for security (set in .env or os.environ)
-    PA_USERNAME = os.environ.get('PA_USERNAME', 'sackson')
-    PA_PASSWORD = os.environ.get('PA_PASSWORD')
-    PG_HOST = os.environ.get('PG_HOST', 'sackson-1234.postgres.pythonanywhere-services.com')  # Your hostname
-    PG_PORT = int(os.environ.get('PG_PORT', 1234))  # Your port
-    PG_USER = os.environ.get('PG_USER')
-    PG_PASS = os.environ.get('PG_PASS')
-    PG_DB = os.environ.get('PG_DB')
+    tunnel.start()
+    return tunnel
 
-    with SSHTunnelForwarder(
-            ('ssh.pythonanywhere.com'),
-            ssh_username=PA_USERNAME,
-            ssh_password=PA_PASSWORD,
-            remote_bind_address=(PG_HOST, PG_PORT)
-    ) as tunnel:
-        engine = create_engine(f"postgresql://{PG_USER}:{PG_PASS}@127.0.0.1:{tunnel.local_bind_port}/{PG_DB}")
-        # Use engine for sessions or queries
+
+def _get_database_url() -> str:
+    """Get database URL, creating SSH tunnel if necessary."""
+    global _tunnel
+    settings = get_settings()
+
+    if settings.DATABASE_URL:
+        return settings.DATABASE_URL
+
+    if settings.use_ssh_tunnel:
+        if _tunnel is None or not _tunnel.is_active:
+            _tunnel = _create_ssh_tunnel()
+        return (
+            f"postgresql://{settings.PG_USER}:{settings.PG_PASS}"
+            f"@127.0.0.1:{_tunnel.local_bind_port}/{settings.PG_DB}"
+        )
+
+    return (
+        f"postgresql://{settings.PG_USER}:{settings.PG_PASS}"
+        f"@{settings.PG_HOST}:{settings.PG_PORT}/{settings.PG_DB}"
+    )
+
+
+def get_engine():
+    """Get or create the database engine."""
+    global _engine
+    if _engine is None:
+        database_url = _get_database_url()
+        _engine = create_engine(
+            database_url,
+            echo=get_settings().DEBUG,
+            pool_pre_ping=True,
+        )
+    return _engine
+
+
+def create_db_and_tables() -> None:
+    """Create all database tables."""
+    engine = get_engine()
+    SQLModel.metadata.create_all(engine)
+
+
+def get_session() -> Generator[Session, None, None]:
+    """Dependency that provides a database session."""
+    engine = get_engine()
+    with Session(engine) as session:
+        try:
+            yield session
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+
+def close_connections() -> None:
+    """Close database connections and SSH tunnel."""
+    global _engine, _tunnel
+
+    if _engine is not None:
+        _engine.dispose()
+        _engine = None
+
+    if _tunnel is not None and _tunnel.is_active:
+        _tunnel.stop()
+        _tunnel = None
